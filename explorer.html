@@ -1,0 +1,742 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HackNative Compiler Explorer</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: #1e1e1e;
+    color: #d4d4d4;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* Top bar */
+  .topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 16px;
+    background: #2d2d2d;
+    border-bottom: 1px solid #404040;
+    flex-shrink: 0;
+    height: 44px;
+  }
+
+  .topbar-left {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .topbar h1 {
+    font-size: 16px;
+    font-weight: 600;
+    color: #e0e0e0;
+  }
+
+  .topbar h1 span {
+    color: #569cd6;
+  }
+
+  .status {
+    font-size: 13px;
+    padding: 3px 10px;
+    border-radius: 12px;
+    transition: all 0.2s;
+  }
+
+  .status.idle { color: #888; }
+  .status.compiling { color: #dcdcaa; background: rgba(220,220,170,0.1); }
+  .status.success { color: #4ec9b0; background: rgba(78,201,176,0.1); }
+  .status.error { color: #f44747; background: rgba(244,71,71,0.1); }
+
+  /* Main split area */
+  .main {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+  }
+
+  .panel {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  .panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 12px;
+    background: #252526;
+    border-bottom: 1px solid #404040;
+    font-size: 13px;
+    color: #aaa;
+    flex-shrink: 0;
+    height: 32px;
+  }
+
+  .panel-header .label {
+    font-weight: 600;
+    color: #ccc;
+  }
+
+  .divider {
+    width: 4px;
+    background: #404040;
+    cursor: col-resize;
+    flex-shrink: 0;
+    transition: background 0.15s;
+  }
+
+  .divider:hover, .divider.dragging {
+    background: #569cd6;
+  }
+
+  .editor-container {
+    flex: 1;
+    overflow: hidden;
+  }
+
+  /* Source-IR mapping highlight */
+  .src-highlight {
+    background: rgba(86, 156, 214, 0.12) !important;
+    border-left: 3px solid rgba(86, 156, 214, 0.6) !important;
+  }
+
+  .ir-highlight {
+    background: rgba(78, 201, 176, 0.12) !important;
+    border-left: 3px solid rgba(78, 201, 176, 0.6) !important;
+  }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="topbar-left">
+    <h1><span>&#9881;</span> HackNative Compiler Explorer</h1>
+  </div>
+  <div class="status idle" id="status">Ready</div>
+</div>
+
+<div class="main">
+  <!-- Source panel -->
+  <div class="panel" id="srcPanel">
+    <div class="panel-header">
+      <span class="label">Hack Source</span>
+      <span style="font-size:11px;color:#666">Auto-compile on change</span>
+    </div>
+    <div class="editor-container" id="srcEditor"></div>
+  </div>
+
+  <!-- Draggable divider -->
+  <div class="divider" id="divider"></div>
+
+  <!-- IR panel -->
+  <div class="panel" id="irPanel">
+    <div class="panel-header">
+      <span class="label">LLVM IR</span>
+      <span style="font-size:11px;color:#666" id="irInfo"></span>
+    </div>
+    <div class="editor-container" id="irEditor"></div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs/loader.js"></script>
+<script>
+// ── Monaco loader ──────────────────────────────────────────────
+require.config({ paths: { vs: 'https://cdn.jsdelivr.net/npm/monaco-editor@0.45.0/min/vs' } });
+
+require(['vs/editor/editor.main'], function () {
+
+  // ── Register Hack language ──────────────────────────────────
+  monaco.languages.register({ id: 'hack' });
+  monaco.languages.setMonarchTokensProvider('hack', {
+    keywords: [
+      'function', 'return', 'if', 'else', 'while', 'for', 'foreach', 'as',
+      'class', 'interface', 'implements', 'extends', 'public', 'private', 'protected',
+      'static', 'new', 'echo', 'print_r', 'impl', 'async', 'await', 'require',
+      'vec', 'dict', 'keyset', 'void', 'int', 'string', 'float', 'bool',
+      'true', 'false', 'null', 'this', 'Awaitable',
+      'vtable', 'fatpointer', 'typetag', 'monomorphize',
+    ],
+    operators: [
+      '=', '>', '<', '!', '~', '?', ':',
+      '==', '<=', '>=', '!=', '&&', '||', '++', '--',
+      '+', '-', '*', '/', '&', '|', '^', '%', '.',
+      '=>', '->', '<<', '>>'
+    ],
+    symbols: /[=><!~?:&|+\-*\/\^%]+/,
+    escapes: /\\(?:[abfnrtv\\"']|x[0-9A-Fa-f]{1,4}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8})/,
+
+    tokenizer: {
+      root: [
+        [/<<__\w+>>/, 'annotation'],
+        [/\$[a-zA-Z_]\w*/, 'variable'],
+        [/[a-zA-Z_]\w*/, { cases: { '@keywords': 'keyword', '@default': 'identifier' } }],
+        { include: '@whitespace' },
+        [/[{}()\[\]]/, '@brackets'],
+        [/@symbols/, { cases: { '@operators': 'operator', '@default': '' } }],
+        [/\d+/, 'number'],
+        [/"([^"\\]|\\.)*$/, 'string.invalid'],
+        [/"/, 'string', '@string'],
+      ],
+      string: [
+        [/[^\\"]+/, 'string'],
+        [/@escapes/, 'string.escape'],
+        [/\\./, 'string.escape.invalid'],
+        [/"/, 'string', '@pop'],
+      ],
+      whitespace: [
+        [/[ \t\r\n]+/, 'white'],
+        [/\/\/.*$/, 'comment'],
+        [/\/\*/, 'comment', '@comment'],
+      ],
+      comment: [
+        [/[^\/*]+/, 'comment'],
+        [/\*\//, 'comment', '@pop'],
+        [/[\/*]/, 'comment'],
+      ],
+    },
+  });
+
+  // ── Register LLVM IR language ───────────────────────────────
+  monaco.languages.register({ id: 'llvm-ir' });
+  monaco.languages.setMonarchTokensProvider('llvm-ir', {
+    tokenizer: {
+      root: [
+        [/;.*$/, 'comment'],
+        [/\b(define|declare|global|constant|private|internal|external|unnamed_addr)\b/, 'keyword'],
+        [/\b(i\d+|void|float|double|ptr|label|opaque)\b/, 'type'],
+        [/\b(ret|br|switch|unreachable|add|sub|mul|sdiv|srem|and|or|xor|shl|lshr|ashr|icmp|fcmp|phi|select|call|invoke|alloca|load|store|getelementptr|bitcast|trunc|zext|sext|ptrtoint|inttoptr|extractvalue|insertvalue|extractelement|insertelement|shufflevector|fneg|fadd|fsub|fmul|fdiv|frem|freeze|va_arg|landingpad|catchpad|cleanuppad|catchswitch|catchret|cleanupret)\b/, 'keyword.instruction'],
+        [/\b(eq|ne|slt|sgt|sle|sge|ult|ugt|ule|uge|nuw|nsw|exact|inbounds|align|to|nonnull|dereferenceable|noundef|signext|zeroext|inreg|byval|sret|noalias|nocapture|nounwind|readnone|readonly|writeonly|willreturn|mustprogress)\b/, 'keyword.attribute'],
+        [/@[\w$.]+/, 'variable.global'],
+        [/%[\w$.]+/, 'variable.local'],
+        [/\b-?\d+\b/, 'number'],
+        [/\bc"([^"\\]|\\.)*"/, 'string'],
+        [/"([^"\\]|\\.)*"/, 'string'],
+        [/[{}()\[\],]/, '@brackets'],
+        [/=/, 'operator'],
+      ],
+    },
+  });
+
+  // ── Custom theme ────────────────────────────────────────────
+  monaco.editor.defineTheme('hack-dark', {
+    base: 'vs-dark',
+    inherit: true,
+    rules: [
+      { token: 'variable', foreground: '9cdcfe' },
+      { token: 'annotation', foreground: 'dcdcaa' },
+      { token: 'keyword.instruction', foreground: 'c586c0' },
+      { token: 'keyword.attribute', foreground: '4ec9b0' },
+      { token: 'variable.global', foreground: '4fc1ff' },
+      { token: 'variable.local', foreground: '9cdcfe' },
+      { token: 'type', foreground: '4ec9b0' },
+    ],
+    colors: {
+      'editor.background': '#1e1e1e',
+    },
+  });
+
+  // ── Default source code ─────────────────────────────────────
+  const defaultSource = `// HackNative Compiler Explorer
+// Edit this code — LLVM IR updates automatically
+
+interface Shape {
+  public function area(): int;
+}
+
+class Circle implements Shape {
+  public int $radius;
+  public function __construct(int $r): void {
+    $this->radius = $r;
+  }
+  public function area(): int {
+    return $this->radius * $this->radius * 3;
+  }
+}
+
+class Rect implements Shape {
+  public int $w;
+  public int $h;
+  public function __construct(int $w, int $h): void {
+    $this->w = $w;
+    $this->h = $h;
+  }
+  public function area(): int {
+    return $this->w * $this->h;
+  }
+}
+
+// Strategy 1: vtable (C++/Java style)
+impl vtable {
+  function showArea_vt(Shape $s): void {
+    echo $s->area();
+    echo "\\n";
+  }
+}
+
+// Strategy 2: fatpointer (Rust dyn Trait style)
+impl fatpointer {
+  function showArea_fp(Shape $s): void {
+    echo $s->area();
+    echo "\\n";
+  }
+}
+
+// Strategy 3: typetag (compiler internal style)
+impl typetag {
+  function showArea_tt(Shape $s): void {
+    echo $s->area();
+    echo "\\n";
+  }
+}
+
+// Strategy 4: monomorphize (Rust generic / C++ template style)
+impl monomorphize {
+  function showArea_mono(Shape $s): void {
+    echo $s->area();
+    echo "\\n";
+  }
+}
+`;
+
+  // ── Create editors ──────────────────────────────────────────
+  const srcEditor = monaco.editor.create(document.getElementById('srcEditor'), {
+    value: defaultSource,
+    language: 'hack',
+    theme: 'hack-dark',
+    fontSize: 14,
+    minimap: { enabled: false },
+    scrollBeyondLastLine: false,
+    automaticLayout: true,
+    tabSize: 2,
+    renderWhitespace: 'none',
+    lineNumbers: 'on',
+    padding: { top: 8 },
+  });
+
+  const irEditor = monaco.editor.create(document.getElementById('irEditor'), {
+    value: '; Compile result will appear here...',
+    language: 'llvm-ir',
+    theme: 'hack-dark',
+    fontSize: 13,
+    minimap: { enabled: false },
+    scrollBeyondLastLine: false,
+    automaticLayout: true,
+    readOnly: true,
+    tabSize: 2,
+    renderWhitespace: 'none',
+    lineNumbers: 'on',
+    padding: { top: 8 },
+  });
+
+  // ── Divider drag ────────────────────────────────────────────
+  const divider = document.getElementById('divider');
+  const srcPanel = document.getElementById('srcPanel');
+  const irPanel = document.getElementById('irPanel');
+  let dragging = false;
+
+  divider.addEventListener('mousedown', (e) => {
+    dragging = true;
+    divider.classList.add('dragging');
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    e.preventDefault();
+  });
+
+  document.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    const container = document.querySelector('.main');
+    const rect = container.getBoundingClientRect();
+    const ratio = (e.clientX - rect.left) / rect.width;
+    const clamped = Math.max(0.2, Math.min(0.8, ratio));
+    srcPanel.style.flex = `${clamped}`;
+    irPanel.style.flex = `${1 - clamped}`;
+  });
+
+  document.addEventListener('mouseup', () => {
+    if (dragging) {
+      dragging = false;
+      divider.classList.remove('dragging');
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    }
+  });
+
+  // ── Compile logic ───────────────────────────────────────────
+  const statusEl = document.getElementById('status');
+  const irInfoEl = document.getElementById('irInfo');
+  let debounceTimer = null;
+  let compileId = 0;
+
+  function setStatus(cls, text) {
+    statusEl.className = 'status ' + cls;
+    statusEl.textContent = text;
+  }
+
+  async function compile() {
+    const code = srcEditor.getValue();
+    if (!code.trim()) {
+      irEditor.setValue('');
+      setStatus('idle', 'Ready');
+      irInfoEl.textContent = '';
+      return;
+    }
+
+    const thisId = ++compileId;
+    setStatus('compiling', 'Compiling...');
+    irInfoEl.textContent = '';
+
+    try {
+      const resp = await fetch('/api/compile', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code }),
+      });
+      const data = await resp.json();
+
+      if (thisId !== compileId) return; // stale
+
+      if (data.error) {
+        irEditor.setValue('; ── Compilation Error ──\n;\n' +
+          data.error.split('\n').map(l => '; ' + l).join('\n'));
+        setStatus('error', 'Error');
+      } else {
+        irEditor.setValue(data.ir || '; (empty output)');
+        const lines = (data.ir || '').split('\n').length;
+        irInfoEl.textContent = lines + ' lines';
+        setStatus('success', 'Compiled');
+      }
+    } catch (err) {
+      if (thisId !== compileId) return;
+      irEditor.setValue('; ── Network Error ──\n; ' + err.message);
+      setStatus('error', 'Error');
+    }
+  }
+
+  srcEditor.onDidChangeModelContent(() => {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(compile, 300);
+  });
+
+  // ── Source ↔ IR mapping & highlight ─────────────────────────
+
+  // Parse source to find top-level constructs and their line ranges
+  // Returns: [{ kind, name, className, startLine, endLine }]
+  function parseSrcConstructs(src) {
+    const lines = src.split('\n');
+    const constructs = [];
+    let currentClass = null;
+    let currentImpl = null;
+    let braceDepth = 0;
+    let constructStack = []; // stack of { construct, startDepth }
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const trimmed = line.trim();
+      const lineNum = i + 1; // 1-based
+
+      // Count braces to track nesting
+      const openBraces = (line.match(/\{/g) || []).length;
+      const closeBraces = (line.match(/\}/g) || []).length;
+
+      // Detect top-level interface: interface Name {
+      const ifaceMatch = trimmed.match(/^interface\s+(\w+)/);
+      if (ifaceMatch && constructStack.length === 0) {
+        const c = { kind: 'interface', name: ifaceMatch[1], startLine: lineNum, endLine: lineNum };
+        constructs.push(c);
+        if (openBraces > closeBraces) {
+          constructStack.push({ construct: c, startDepth: braceDepth });
+        }
+        braceDepth += openBraces - closeBraces;
+        continue;
+      }
+
+      // Detect class: class Name [implements X] {
+      const classMatch = trimmed.match(/^class\s+(\w+)/);
+      if (classMatch && constructStack.length === 0) {
+        currentClass = classMatch[1];
+        const c = { kind: 'class', name: currentClass, startLine: lineNum, endLine: lineNum, methods: [] };
+        constructs.push(c);
+        if (openBraces > closeBraces) {
+          constructStack.push({ construct: c, startDepth: braceDepth });
+        }
+        braceDepth += openBraces - closeBraces;
+        continue;
+      }
+
+      // Detect impl block: impl strategy {
+      const implMatch = trimmed.match(/^impl\s+(\w+)/);
+      if (implMatch && constructStack.length === 0) {
+        currentImpl = implMatch[1];
+        const c = { kind: 'impl', name: currentImpl, startLine: lineNum, endLine: lineNum, functions: [] };
+        constructs.push(c);
+        if (openBraces > closeBraces) {
+          constructStack.push({ construct: c, startDepth: braceDepth });
+        }
+        braceDepth += openBraces - closeBraces;
+        continue;
+      }
+
+      // Detect method inside class
+      const methodMatch = trimmed.match(/(?:public|private|protected)\s+function\s+(\w+)/);
+      if (methodMatch && constructStack.length > 0 && constructStack[constructStack.length - 1].construct.kind === 'class') {
+        const parentClass = constructStack[constructStack.length - 1].construct;
+        const m = { kind: 'method', name: methodMatch[1], className: parentClass.name, startLine: lineNum, endLine: lineNum };
+        constructs.push(m);
+        parentClass.methods.push(m);
+        if (openBraces > closeBraces) {
+          constructStack.push({ construct: m, startDepth: braceDepth });
+        }
+        braceDepth += openBraces - closeBraces;
+        continue;
+      }
+
+      // Detect function inside impl block
+      const implFnMatch = trimmed.match(/^function\s+(\w+)/);
+      if (implFnMatch && constructStack.length > 0 && constructStack[constructStack.length - 1].construct.kind === 'impl') {
+        const parentImpl = constructStack[constructStack.length - 1].construct;
+        const f = { kind: 'impl_fn', name: implFnMatch[1], implStrategy: parentImpl.name, startLine: lineNum, endLine: lineNum };
+        constructs.push(f);
+        parentImpl.functions.push(f);
+        if (openBraces > closeBraces) {
+          constructStack.push({ construct: f, startDepth: braceDepth });
+        }
+        braceDepth += openBraces - closeBraces;
+        continue;
+      }
+
+      // Detect top-level function
+      const fnMatch = trimmed.match(/^(?:async\s+)?function\s+(\w+)/);
+      if (fnMatch && constructStack.length === 0) {
+        const c = { kind: 'function', name: fnMatch[1], startLine: lineNum, endLine: lineNum };
+        constructs.push(c);
+        if (openBraces > closeBraces) {
+          constructStack.push({ construct: c, startDepth: braceDepth });
+        }
+        braceDepth += openBraces - closeBraces;
+        continue;
+      }
+
+      // Detect <<__EntryPoint>> annotated function
+      if (trimmed.match(/^<<__\w+>>/)) {
+        // Check next non-empty line for function
+        braceDepth += openBraces - closeBraces;
+        continue;
+      }
+
+      // Update brace depth and close constructs
+      braceDepth += openBraces - closeBraces;
+      while (constructStack.length > 0 && braceDepth <= constructStack[constructStack.length - 1].startDepth) {
+        const popped = constructStack.pop();
+        popped.construct.endLine = lineNum;
+        if (popped.construct.kind === 'class') currentClass = null;
+        if (popped.construct.kind === 'impl') currentImpl = null;
+      }
+    }
+
+    // Close any remaining
+    while (constructStack.length > 0) {
+      const popped = constructStack.pop();
+      popped.construct.endLine = lines.length;
+    }
+
+    return constructs;
+  }
+
+  // Parse IR to find define blocks, type defs, and globals with line ranges
+  function parseIrBlocks(ir) {
+    const lines = ir.split('\n');
+    const blocks = []; // { kind, name, startLine, endLine }
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const trimmed = line.trim();
+      const lineNum = i + 1;
+
+      // Type definition: %Circle = type { ... }
+      const typeMatch = trimmed.match(/^%(\w+)\s*=\s*type\b/);
+      if (typeMatch) {
+        blocks.push({ kind: 'type', name: typeMatch[1], startLine: lineNum, endLine: lineNum });
+        continue;
+      }
+
+      // Global: @Circle.Shape.vtable = ...
+      const globalMatch = trimmed.match(/^@([\w.]+)\s*=/);
+      if (globalMatch) {
+        blocks.push({ kind: 'global', name: globalMatch[1], startLine: lineNum, endLine: lineNum });
+        continue;
+      }
+
+      // Define block: define ... @name(...) {
+      const defineMatch = trimmed.match(/^define\s+.*@([\w.]+)\s*\(/);
+      if (defineMatch) {
+        const name = defineMatch[1];
+        const start = lineNum;
+        // Find closing }
+        let end = start;
+        for (let j = i + 1; j < lines.length; j++) {
+          if (lines[j].trimStart().startsWith('}')) {
+            end = j + 1;
+            break;
+          }
+        }
+        blocks.push({ kind: 'define', name: name, startLine: start, endLine: end });
+        continue;
+      }
+    }
+    return blocks;
+  }
+
+  // Given a source construct, find matching IR blocks
+  function findIrMatches(construct, irBlocks) {
+    const matches = [];
+    for (const block of irBlocks) {
+      if (matchesConstruct(construct, block)) {
+        matches.push(block);
+      }
+    }
+    return matches;
+  }
+
+  function matchesConstruct(construct, irBlock) {
+    const irName = irBlock.name;
+    switch (construct.kind) {
+      case 'function':
+        // @funcName
+        return irBlock.kind === 'define' && irName === construct.name;
+
+      case 'class':
+        // %ClassName type, @ClassName.* globals, @ClassName.* defines
+        if (irBlock.kind === 'type' && irName === construct.name) return true;
+        if (irName.startsWith(construct.name + '.')) return true;
+        return false;
+
+      case 'method':
+        // @ClassName.methodName
+        return irBlock.kind === 'define' && irName === construct.className + '.' + construct.name;
+
+      case 'impl_fn':
+        // For monomorphize: @fnName, @fnName.Circle, @fnName.Rect, etc.
+        // For others: @fnName
+        if (irBlock.kind !== 'define') return false;
+        return irName === construct.name || irName.startsWith(construct.name + '.');
+
+      case 'impl':
+        // Match all functions in this impl block
+        return false; // handled by child impl_fn
+
+      case 'interface':
+        // Interfaces don't produce IR directly
+        return false;
+
+      default:
+        return false;
+    }
+  }
+
+  // Decoration tracking
+  let srcDecorations = [];
+  let irDecorations = [];
+
+  function clearHighlights() {
+    srcDecorations = srcEditor.deltaDecorations(srcDecorations, []);
+    irDecorations = irEditor.deltaDecorations(irDecorations, []);
+  }
+
+  function highlightIrLines(irMatches) {
+    if (irMatches.length === 0) {
+      irDecorations = irEditor.deltaDecorations(irDecorations, []);
+      return;
+    }
+
+    const decorations = [];
+    for (const m of irMatches) {
+      decorations.push({
+        range: new monaco.Range(m.startLine, 1, m.endLine, 1),
+        options: {
+          isWholeLine: true,
+          className: 'ir-highlight',
+          overviewRuler: { color: '#569cd644', position: monaco.editor.OverviewRulerLane.Full },
+        },
+      });
+    }
+    irDecorations = irEditor.deltaDecorations(irDecorations, decorations);
+
+    // Scroll to first match
+    irEditor.revealLineInCenter(irMatches[0].startLine);
+  }
+
+  function highlightSrcLines(construct) {
+    if (!construct) {
+      srcDecorations = srcEditor.deltaDecorations(srcDecorations, []);
+      return;
+    }
+    srcDecorations = srcEditor.deltaDecorations(srcDecorations, [{
+      range: new monaco.Range(construct.startLine, 1, construct.endLine, 1),
+      options: {
+        isWholeLine: true,
+        className: 'src-highlight',
+      },
+    }]);
+  }
+
+  // On cursor position change in source editor
+  let lastHighlightedConstruct = null;
+
+  srcEditor.onDidChangeCursorPosition((e) => {
+    const cursorLine = e.position.lineNumber;
+    const src = srcEditor.getValue();
+    const ir = irEditor.getValue();
+
+    if (ir.startsWith('; ──')) return; // error state
+
+    const constructs = parseSrcConstructs(src);
+    const irBlocks = parseIrBlocks(ir);
+
+    // Find the most specific construct containing the cursor
+    let bestMatch = null;
+    for (const c of constructs) {
+      if (cursorLine >= c.startLine && cursorLine <= c.endLine) {
+        // Prefer more specific (method > class, impl_fn > impl)
+        if (!bestMatch || (c.kind === 'method' || c.kind === 'impl_fn')) {
+          bestMatch = c;
+        }
+      }
+    }
+
+    if (bestMatch && bestMatch === lastHighlightedConstruct) return;
+    lastHighlightedConstruct = bestMatch;
+
+    if (!bestMatch) {
+      clearHighlights();
+      return;
+    }
+
+    highlightSrcLines(bestMatch);
+    const irMatches = findIrMatches(bestMatch, irBlocks);
+    highlightIrLines(irMatches);
+  });
+
+  srcEditor.onDidChangeModelContent(() => {
+    clearTimeout(debounceTimer);
+    lastHighlightedConstruct = null;
+    debounceTimer = setTimeout(compile, 300);
+  });
+
+  // Initial compile
+  compile();
+});
+</script>
+</body>
+</html>
