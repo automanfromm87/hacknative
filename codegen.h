@@ -27,8 +27,7 @@ private:
   llvm::Value *emitInterfaceDispatch(const std::string &varName,
                                      llvm::Value *obj,
                                      const std::string &methodName,
-                                     const std::vector<llvm::Value *> &extraArgs,
-                                     DispatchStrategy strategy);
+                                     const std::vector<llvm::Value *> &extraArgs);
 
   llvm::LLVMContext context_;
   std::unique_ptr<llvm::Module> module_;
@@ -63,15 +62,12 @@ private:
   };
   std::map<std::string, InterfaceInfo> interfaces_;
 
-  // Dispatch tracking
-  DispatchStrategy currentImplStrategy_ = DispatchStrategy::Vtable;
-  std::map<std::string, DispatchStrategy> funcImplStrategy_;
+  // Parameter type name tracking
   std::map<std::string, std::vector<std::string>> funcParamTypeNames_;
 
   // Variable type tracking
   std::map<std::string, std::string> varInterfaceName_; // var -> interface name
   std::map<std::string, std::string> varClassName_;     // var -> concrete class name
-  std::map<std::string, llvm::AllocaInst *> fatPtrVtables_; // var -> vtable alloca (fatpointer)
 
   // Cached printf format string constants (avoid duplicates)
   std::map<std::string, llvm::Constant *> fmtStrings_;

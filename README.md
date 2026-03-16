@@ -10,8 +10,7 @@ A native compiler for a Hack-inspired language, powered by LLVM. Compiles Hack-s
 - **Hack-compatible syntax**: functions, classes, interfaces, `vec`, `dict`, `foreach`, async/await style
 - **C FFI** using HHI-style declarations (`function name(params): type;`)
 - **`require`** for including declaration files (`.hhi`)
-- **4 polymorphic dispatch strategies**: vtable, fat pointer, type tag, monomorphize
-- **Interactive explorer** with side-by-side Hack source / LLVM IR view
+- **Interface polymorphism** with vtable dispatch
 
 ## Quick Start
 
@@ -95,12 +94,12 @@ class Point {
   }
 }
 
-// Interfaces + dispatch strategies
+// Interfaces + vtable dispatch
 interface Shape {
   public function area(): int;
 }
 
-impl vtable {
+impl {
   function showArea(Shape $s): void {
     echo $s->area();
   }
@@ -125,22 +124,11 @@ hacknative/
 ├── codegen.h / codegen.cc   # LLVM IR generation
 ├── main.cc                  # CLI driver
 ├── runtime.c                # Runtime library (strings, vec, dict, SDL2 helpers)
-├── explorer.html            # Interactive source/IR explorer
 ├── sdl2/
 │   ├── main.hack            # 3D raytraced sphere demo
 │   └── sdl2.hhi             # SDL2 function declarations
 └── CMakeLists.txt
 ```
-
-## Explorer
-
-Launch the interactive explorer to view Hack source alongside generated LLVM IR:
-
-```bash
-python3 explorer.py
-```
-
-Then open `http://localhost:8080` in your browser.
 
 ## License
 

@@ -269,11 +269,7 @@ struct InterfaceDecl {
   std::vector<InterfaceMethodSig> methods;
 };
 
-// Dispatch strategy for impl blocks
-enum class DispatchStrategy { Vtable, FatPointer, TypeTag, Monomorphize };
-
 struct ImplBlock {
-  DispatchStrategy strategy;
   std::vector<FuncDecl> functions;
 };
 

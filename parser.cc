@@ -597,16 +597,7 @@ InterfaceDecl Parser::parseInterfaceDecl() {
 ImplBlock Parser::parseImplBlock() {
   ImplBlock block;
   expect(TokenKind::KwImpl, "expected 'impl'");
-  if (!check(TokenKind::Identifier))
-    throw std::runtime_error("expected dispatch strategy after 'impl'");
-  std::string strategy = advance().text;
-  if (strategy == "vtable") block.strategy = DispatchStrategy::Vtable;
-  else if (strategy == "fatpointer") block.strategy = DispatchStrategy::FatPointer;
-  else if (strategy == "typetag") block.strategy = DispatchStrategy::TypeTag;
-  else if (strategy == "monomorphize") block.strategy = DispatchStrategy::Monomorphize;
-  else throw std::runtime_error("unknown dispatch strategy: " + strategy);
-
-  expect(TokenKind::LBrace, "expected '{' after impl strategy");
+  expect(TokenKind::LBrace, "expected '{' after impl");
   while (!check(TokenKind::RBrace) && !check(TokenKind::Eof)) {
     block.functions.push_back(parseFuncDecl(false));
   }
@@ -896,16 +887,6 @@ static void dumpStmt(const Stmt &stmt, std::ostream &os, int indent) {
   }
 }
 
-static const char *dispatchStrategyName(DispatchStrategy s) {
-  switch (s) {
-  case DispatchStrategy::Vtable: return "vtable";
-  case DispatchStrategy::FatPointer: return "fatpointer";
-  case DispatchStrategy::TypeTag: return "typetag";
-  case DispatchStrategy::Monomorphize: return "monomorphize";
-  }
-  return "?";
-}
-
 void dumpAST(const Program &prog, std::ostream &os, int indent) {
   os << "Program\n";
   for (const auto &iface : prog.interfaces) {
@@ -959,7 +940,7 @@ void dumpAST(const Program &prog, std::ostream &os, int indent) {
     }
   }
   for (const auto &impl : prog.implBlocks) {
-    os << "  ImplBlock [" << dispatchStrategyName(impl.strategy) << "]\n";
+    os << "  ImplBlock\n";
     for (const auto &func : impl.functions) {
       os << "    FuncDecl \"" << func.name << "\"";
       os << " -> " << hackTypeName(func.hackReturnType);

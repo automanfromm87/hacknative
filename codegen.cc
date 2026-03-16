@@ -238,8 +238,7 @@ void Codegen::emitClassDecl(const ClassDecl &cls) {
 llvm::Value *Codegen::emitInterfaceDispatch(const std::string &varName,
                                             llvm::Value *obj,
                                             const std::string &methodName,
-                                            const std::vector<llvm::Value *> &extraArgs,
-                                            DispatchStrategy strategy) {
+                                            const std::vector<llvm::Value *> &extraArgs) {
   auto ifaceIt = varInterfaceName_.find(varName);
   if (ifaceIt == varInterfaceName_.end()) return builder_.getInt32(0);
   const std::string &ifaceName = ifaceIt->second;
@@ -273,121 +272,21 @@ llvm::Value *Codegen::emitInterfaceDispatch(const std::string &varName,
   std::vector<llvm::Type *> vtSlotTypes = {ptrTy};
   auto *vtSlotStructTy = llvm::StructType::get(context_, vtSlotTypes);
 
-  if (strategy == DispatchStrategy::Vtable) {
-    // load vtable from obj[0], GEP slot, indirect call
-    auto *vtableSlot = plainStructGEP(
-        vtSlotStructTy, obj, 0, "vtable.slot");
-    auto *vtablePtr = builder_.CreateLoad(ptrTy, vtableSlot, "vtable");
-    // GEP into vtable array
-    auto *vtableArrayTy = llvm::ArrayType::get(ptrTy, infoIt->second.methods.size());
-    auto *fnSlot = builder_.CreateGEP(vtableArrayTy, vtablePtr,
-        {builder_.getInt32(0), builder_.getInt32(methodIdx)}, "fn.slot");
-    auto *fn = builder_.CreateLoad(ptrTy, fnSlot, "fn");
-    std::vector<llvm::Value *> args;
-    args.push_back(obj);
-    args.insert(args.end(), extraArgs.begin(), extraArgs.end());
-    if (llvmRetTy->isVoidTy())
-      return builder_.CreateCall(fnTy, fn, args);
-    return builder_.CreateCall(fnTy, fn, args, "vcall");
-  }
-
-  if (strategy == DispatchStrategy::FatPointer) {
-    // vtable is stored in fatPtrVtables_[varName]
-    auto fpIt = fatPtrVtables_.find(varName);
-    if (fpIt == fatPtrVtables_.end()) return builder_.getInt32(0);
-    auto *vtablePtr = builder_.CreateLoad(ptrTy, fpIt->second, "fp.vtable");
-    auto *vtableArrayTy = llvm::ArrayType::get(ptrTy, infoIt->second.methods.size());
-    auto *fnSlot = builder_.CreateGEP(vtableArrayTy, vtablePtr,
-        {builder_.getInt32(0), builder_.getInt32(methodIdx)}, "fp.fn.slot");
-    auto *fn = builder_.CreateLoad(ptrTy, fnSlot, "fp.fn");
-    std::vector<llvm::Value *> args;
-    args.push_back(obj);
-    args.insert(args.end(), extraArgs.begin(), extraArgs.end());
-    if (llvmRetTy->isVoidTy())
-      return builder_.CreateCall(fnTy, fn, args);
-    return builder_.CreateCall(fnTy, fn, args, "fpcall");
-  }
-
-  if (strategy == DispatchStrategy::TypeTag) {
-    // load vtable ptr from obj[0], compare with known vtables, branch to direct calls
-    auto *vtableSlot = plainStructGEP(
-        vtSlotStructTy, obj, 0, "tt.vtable.slot");
-    auto *vtablePtr = builder_.CreateLoad(ptrTy, vtableSlot, "tt.vtable");
-
-    auto *curFunc = builder_.GetInsertBlock()->getParent();
-
-    // Collect all classes implementing this interface
-    std::vector<std::pair<std::string, ClassInfo*>> implClasses;
-    for (auto &[cn, ci] : classTypes_) {
-      if (ci.implementsInterface && ci.interfaceName == ifaceName) {
-        implClasses.push_back({cn, &ci});
-      }
-    }
-
-    auto *mergeBB = llvm::BasicBlock::Create(context_, "tt.merge", curFunc);
-    llvm::PHINode *phi = nullptr;
-    if (!llvmRetTy->isVoidTy()) {
-      // We'll set up phi after creating all branches
-    }
-
-    // Build chain of comparisons
-    struct BranchResult {
-      llvm::BasicBlock *bb;
-      llvm::Value *val;
-    };
-    std::vector<BranchResult> results;
-
-    // Create a default/fallback BB that also branches to merge
-    auto *defaultBB = llvm::BasicBlock::Create(context_, "tt.default", curFunc);
-
-    for (size_t i = 0; i < implClasses.size(); ++i) {
-      auto &[cn, ci] = implClasses[i];
-      auto *thenBB = llvm::BasicBlock::Create(context_, "tt." + cn, curFunc);
-      auto *nextBB = (i + 1 < implClasses.size())
-          ? llvm::BasicBlock::Create(context_, "tt.next", curFunc)
-          : defaultBB;
-
-      auto *cmp = builder_.CreateICmpEQ(vtablePtr, ci->vtableGlobal, "tt.cmp." + cn);
-      builder_.CreateCondBr(cmp, thenBB, nextBB);
-
-      builder_.SetInsertPoint(thenBB);
-      std::string directName = cn + "." + methodName;
-      auto *directFn = module_->getFunction(directName);
-      llvm::Value *result = nullptr;
-      if (directFn) {
-        std::vector<llvm::Value *> args;
-        args.push_back(obj);
-        args.insert(args.end(), extraArgs.begin(), extraArgs.end());
-        if (llvmRetTy->isVoidTy())
-          builder_.CreateCall(directFn, args);
-        else
-          result = builder_.CreateCall(directFn, args, "tt.call." + cn);
-      }
-      builder_.CreateBr(mergeBB);
-      results.push_back({builder_.GetInsertBlock(), result});
-
-      if (i + 1 < implClasses.size())
-        builder_.SetInsertPoint(nextBB);
-    }
-
-    // Default block: no match (shouldn't happen, but need valid IR)
-    builder_.SetInsertPoint(defaultBB);
-    builder_.CreateBr(mergeBB);
-
-    builder_.SetInsertPoint(mergeBB);
-    if (!llvmRetTy->isVoidTy()) {
-      phi = builder_.CreatePHI(llvmRetTy, results.size() + 1, "tt.result");
-      for (auto &r : results) {
-        phi->addIncoming(r.val ? r.val : llvm::Constant::getNullValue(llvmRetTy), r.bb);
-      }
-      phi->addIncoming(llvm::Constant::getNullValue(llvmRetTy), defaultBB);
-      return phi;
-    }
-    return builder_.getInt32(0);
-  }
-
-  // Should not reach here (monomorphize doesn't use emitInterfaceDispatch)
-  return builder_.getInt32(0);
+  // Vtable dispatch: load vtable from obj[0], GEP slot, indirect call
+  auto *vtableSlot = plainStructGEP(
+      vtSlotStructTy, obj, 0, "vtable.slot");
+  auto *vtablePtr = builder_.CreateLoad(ptrTy, vtableSlot, "vtable");
+  // GEP into vtable array
+  auto *vtableArrayTy = llvm::ArrayType::get(ptrTy, infoIt->second.methods.size());
+  auto *fnSlot = builder_.CreateGEP(vtableArrayTy, vtablePtr,
+      {builder_.getInt32(0), builder_.getInt32(methodIdx)}, "fn.slot");
+  auto *fn = builder_.CreateLoad(ptrTy, fnSlot, "fn");
+  std::vector<llvm::Value *> args;
+  args.push_back(obj);
+  args.insert(args.end(), extraArgs.begin(), extraArgs.end());
+  if (llvmRetTy->isVoidTy())
+    return builder_.CreateCall(fnTy, fn, args);
+  return builder_.CreateCall(fnTy, fn, args, "vcall");
 }
 
 llvm::Value *Codegen::emitExpr(const Expr &expr) {
@@ -454,80 +353,6 @@ llvm::Value *Codegen::emitExpr(const Expr &expr) {
         return builder_.CreateCall(module_->getFunction("hack_print_r_dict"), {arg});
       builder_.CreateCall(module_->getFunction("hack_print_r_vec"), {arg});
       return builder_.getInt32(0);
-    }
-
-    // Check if this is a call to an impl block function
-    auto stratIt = funcImplStrategy_.find(call.name);
-    if (stratIt != funcImplStrategy_.end()) {
-      DispatchStrategy strat = stratIt->second;
-
-      if (strat == DispatchStrategy::FatPointer) {
-        // Expand interface params: for each interface param, pass (obj, vtable_from_obj[0])
-        auto *ptrTy = llvm::PointerType::getUnqual(context_);
-        auto *func = module_->getFunction(call.name);
-        if (!func) {
-          llvm::errs() << "Undefined function: " << call.name << "\n";
-          return builder_.getInt32(0);
-        }
-        std::vector<llvm::Value *> argValues;
-        auto typeNamesIt = funcParamTypeNames_.find(call.name);
-        for (size_t i = 0; i < call.args.size(); ++i) {
-          auto *val = emitExpr(*call.args[i]);
-          bool isIfaceParam = false;
-          if (typeNamesIt != funcParamTypeNames_.end() && i < typeNamesIt->second.size()) {
-            auto ifIt = interfaces_.find(typeNamesIt->second[i]);
-            if (ifIt != interfaces_.end()) {
-              isIfaceParam = true;
-              // Pass data pointer
-              argValues.push_back(val);
-              // Extract vtable from obj[0]
-              std::vector<llvm::Type *> slotTypes = {ptrTy};
-              auto *slotStructTy = llvm::StructType::get(context_, slotTypes);
-              auto *vtableSlot = plainStructGEP(
-                  slotStructTy, val, 0, "fp.extract.vt.slot");
-              auto *vtable = builder_.CreateLoad(ptrTy, vtableSlot, "fp.extract.vt");
-              argValues.push_back(vtable);
-            }
-          }
-          if (!isIfaceParam) {
-            argValues.push_back(val);
-          }
-        }
-        if (func->getReturnType()->isVoidTy())
-          return builder_.CreateCall(func, argValues);
-        return builder_.CreateCall(func, argValues, "calltmp");
-      }
-
-      if (strat == DispatchStrategy::Monomorphize) {
-        // Call funcName.ConcreteClass based on varClassName_
-        auto typeNamesIt = funcParamTypeNames_.find(call.name);
-        std::string suffix;
-        for (size_t i = 0; i < call.args.size(); ++i) {
-          if (typeNamesIt != funcParamTypeNames_.end() && i < typeNamesIt->second.size()) {
-            auto ifIt = interfaces_.find(typeNamesIt->second[i]);
-            if (ifIt != interfaces_.end() && call.args[i]->kind == ExprKind::VarRef) {
-              auto &ref = static_cast<const VarRefExpr &>(*call.args[i]);
-              auto cnIt = varClassName_.find(ref.name);
-              if (cnIt != varClassName_.end()) {
-                suffix = "." + cnIt->second;
-              }
-            }
-          }
-        }
-        std::string monoName = call.name + suffix;
-        auto *func = module_->getFunction(monoName);
-        if (!func) {
-          llvm::errs() << "Undefined monomorphized function: " << monoName << "\n";
-          return builder_.getInt32(0);
-        }
-        std::vector<llvm::Value *> argValues;
-        for (size_t i = 0; i < call.args.size(); ++i) {
-          argValues.push_back(emitExpr(*call.args[i]));
-        }
-        if (func->getReturnType()->isVoidTy())
-          return builder_.CreateCall(func, argValues);
-        return builder_.CreateCall(func, argValues, "calltmp");
-      }
     }
 
     auto *func = module_->getFunction(call.name);
@@ -677,7 +502,7 @@ llvm::Value *Codegen::emitExpr(const Expr &expr) {
       extraArgs.push_back(emitExpr(*a));
     }
 
-    // Check if this is a variable with known concrete class (monomorphize direct call)
+    // Check if this is a variable with known concrete class (direct call)
     if (mc.object->kind == ExprKind::VarRef) {
       auto &ref = static_cast<const VarRefExpr &>(*mc.object);
       auto cnIt = varClassName_.find(ref.name);
@@ -698,7 +523,7 @@ llvm::Value *Codegen::emitExpr(const Expr &expr) {
       // Check if interface variable → dispatch
       auto ifIt = varInterfaceName_.find(ref.name);
       if (ifIt != varInterfaceName_.end()) {
-        return emitInterfaceDispatch(ref.name, obj, mc.method, extraArgs, currentImplStrategy_);
+        return emitInterfaceDispatch(ref.name, obj, mc.method, extraArgs);
       }
     }
 
@@ -1142,70 +967,25 @@ void Codegen::emitFunction(const FuncDecl &decl) {
   namedValues_.clear();
   varInterfaceName_.clear();
   varClassName_.clear();
-  fatPtrVtables_.clear();
 
-  // For impl block functions with fatpointer, params are expanded
-  auto stratIt = funcImplStrategy_.find(decl.name);
-  bool isFatPointer = (stratIt != funcImplStrategy_.end() &&
-                       stratIt->second == DispatchStrategy::FatPointer);
+  // Normal parameter handling
+  size_t idx = 0;
+  auto typeNamesIt = funcParamTypeNames_.find(decl.name);
+  for (auto &arg : func->args()) {
+    auto &param = decl.params[idx];
+    auto *alloca = builder_.CreateAlloca(getLLVMType(param.type), nullptr, param.name);
+    builder_.CreateStore(&arg, alloca);
+    namedValues_[param.name] = {alloca, param.type};
+    arg.setName(param.name);
 
-  if (isFatPointer) {
-    // Parameters are expanded: interface params become (data, vtable) pairs
-    auto typeNamesIt = funcParamTypeNames_.find(decl.name);
-    size_t argIdx = 0;
-    for (size_t i = 0; i < decl.params.size(); ++i) {
-      auto &param = decl.params[i];
-      bool isIfaceParam = false;
-      if (typeNamesIt != funcParamTypeNames_.end() && i < typeNamesIt->second.size()) {
-        auto ifIt = interfaces_.find(typeNamesIt->second[i]);
-        if (ifIt != interfaces_.end()) isIfaceParam = true;
-      }
-      if (isIfaceParam) {
-        // Two args: data ptr and vtable ptr
-        auto *dataArg = func->getArg(argIdx);
-        auto *vtableArg = func->getArg(argIdx + 1);
-        dataArg->setName(param.name + ".data");
-        vtableArg->setName(param.name + ".vtable");
-
-        auto *dataAlloca = builder_.CreateAlloca(llvm::PointerType::getUnqual(context_), nullptr, param.name);
-        builder_.CreateStore(dataArg, dataAlloca);
-        namedValues_[param.name] = {dataAlloca, HackType::Object};
-
-        auto *vtAlloca = builder_.CreateAlloca(llvm::PointerType::getUnqual(context_), nullptr, param.name + ".vt");
-        builder_.CreateStore(vtableArg, vtAlloca);
-        fatPtrVtables_[param.name] = vtAlloca;
-
-        varInterfaceName_[param.name] = typeNamesIt->second[i];
-        argIdx += 2;
-      } else {
-        auto *arg = func->getArg(argIdx);
-        arg->setName(param.name);
-        auto *alloca = builder_.CreateAlloca(getLLVMType(param.type), nullptr, param.name);
-        builder_.CreateStore(arg, alloca);
-        namedValues_[param.name] = {alloca, param.type};
-        argIdx++;
+    // Track interface params
+    if (typeNamesIt != funcParamTypeNames_.end() && idx < typeNamesIt->second.size()) {
+      auto ifIt = interfaces_.find(typeNamesIt->second[idx]);
+      if (ifIt != interfaces_.end()) {
+        varInterfaceName_[param.name] = typeNamesIt->second[idx];
       }
     }
-  } else {
-    // Normal parameter handling
-    size_t idx = 0;
-    auto typeNamesIt = funcParamTypeNames_.find(decl.name);
-    for (auto &arg : func->args()) {
-      auto &param = decl.params[idx];
-      auto *alloca = builder_.CreateAlloca(getLLVMType(param.type), nullptr, param.name);
-      builder_.CreateStore(&arg, alloca);
-      namedValues_[param.name] = {alloca, param.type};
-      arg.setName(param.name);
-
-      // Track interface params
-      if (typeNamesIt != funcParamTypeNames_.end() && idx < typeNamesIt->second.size()) {
-        auto ifIt = interfaces_.find(typeNamesIt->second[idx]);
-        if (ifIt != interfaces_.end()) {
-          varInterfaceName_[param.name] = typeNamesIt->second[idx];
-        }
-      }
-      ++idx;
-    }
+    ++idx;
   }
 
   emitBlock(decl.body, decl);
@@ -1259,17 +1039,8 @@ void Codegen::compile(const Program &prog) {
       std::vector<std::string> paramTypeNames;
       for (const auto &param : decl.params) {
         paramTypeNames.push_back(param.typeName);
-        auto ifIt = interfaces_.find(param.typeName);
-        if (ifIt != interfaces_.end() && impl.strategy == DispatchStrategy::FatPointer) {
-          // Expand to (data_ptr, vtable_ptr)
-          paramTypes.push_back(ptrTy);
-          paramTypes.push_back(ptrTy);
-          paramHackTypes.push_back(HackType::Object);
-          paramHackTypes.push_back(HackType::Object);
-        } else {
-          paramTypes.push_back(getLLVMType(param.type));
-          paramHackTypes.push_back(param.type);
-        }
+        paramTypes.push_back(getLLVMType(param.type));
+        paramHackTypes.push_back(param.type);
       }
 
       auto *funcType = llvm::FunctionType::get(retTy, paramTypes, false);
@@ -1277,7 +1048,6 @@ void Codegen::compile(const Program &prog) {
                              funcName, module_.get());
       funcTypes_[decl.name] = decl.hackReturnType;
       funcParamTypes_[decl.name] = std::move(paramHackTypes);
-      funcImplStrategy_[decl.name] = impl.strategy;
       funcParamTypeNames_[decl.name] = std::move(paramTypeNames);
     }
   }
@@ -1305,39 +1075,6 @@ void Codegen::compile(const Program &prog) {
                            funcName, module_.get());
     funcTypes_[decl.name] = decl.hackReturnType;
     funcParamTypes_[decl.name] = std::move(paramHackTypes);
-  }
-
-  // Generate monomorphized function copies
-  for (const auto &impl : prog.implBlocks) {
-    if (impl.strategy != DispatchStrategy::Monomorphize) continue;
-    for (const auto &decl : impl.functions) {
-      auto typeNamesIt = funcParamTypeNames_.find(decl.name);
-      if (typeNamesIt == funcParamTypeNames_.end()) continue;
-
-      // Find interface params and generate a copy for each implementing class
-      for (size_t pi = 0; pi < decl.params.size(); ++pi) {
-        if (pi >= typeNamesIt->second.size()) continue;
-        auto ifIt = interfaces_.find(typeNamesIt->second[pi]);
-        if (ifIt == interfaces_.end()) continue;
-
-        // For each class implementing this interface
-        for (auto &[className, classInfo] : classTypes_) {
-          if (!classInfo.implementsInterface || classInfo.interfaceName != ifIt->first) continue;
-
-          std::string monoName = decl.name + "." + className;
-          // Same signature as original but with concrete type
-          llvm::Type *retTy = getLLVMType(decl.hackReturnType);
-          std::vector<llvm::Type *> paramTypes;
-          for (const auto &param : decl.params) {
-            paramTypes.push_back(getLLVMType(param.type));
-          }
-          auto *funcType = llvm::FunctionType::get(retTy, paramTypes, false);
-          llvm::Function::Create(funcType, llvm::Function::ExternalLinkage,
-                                 monoName, module_.get());
-          funcTypes_[monoName] = decl.hackReturnType;
-        }
-      }
-    }
   }
 
   // Generate vtable globals (now that all methods are declared)
@@ -1377,7 +1114,6 @@ void Codegen::compile(const Program &prog) {
       namedValues_.clear();
       varInterfaceName_.clear();
       varClassName_.clear();
-      fatPtrVtables_.clear();
       currentClassName_ = cls.name;
 
       auto *argIt = func->arg_begin();
@@ -1415,76 +1151,14 @@ void Codegen::compile(const Program &prog) {
 
   // Emit impl block function bodies
   for (const auto &impl : prog.implBlocks) {
-    currentImplStrategy_ = impl.strategy;
     for (const auto &decl : impl.functions) {
       emitFunction(decl);
-    }
-
-    // For monomorphize, also emit the specialized copies
-    if (impl.strategy == DispatchStrategy::Monomorphize) {
-      for (const auto &decl : impl.functions) {
-        auto typeNamesIt = funcParamTypeNames_.find(decl.name);
-        if (typeNamesIt == funcParamTypeNames_.end()) continue;
-
-        for (size_t pi = 0; pi < decl.params.size(); ++pi) {
-          if (pi >= typeNamesIt->second.size()) continue;
-          auto ifIt = interfaces_.find(typeNamesIt->second[pi]);
-          if (ifIt == interfaces_.end()) continue;
-
-          for (auto &[className, classInfo] : classTypes_) {
-            if (!classInfo.implementsInterface || classInfo.interfaceName != ifIt->first) continue;
-
-            std::string monoName = decl.name + "." + className;
-            auto *func = module_->getFunction(monoName);
-            if (!func) continue;
-
-            auto *entry = llvm::BasicBlock::Create(context_, "entry", func);
-            builder_.SetInsertPoint(entry);
-            namedValues_.clear();
-            varInterfaceName_.clear();
-            varClassName_.clear();
-            fatPtrVtables_.clear();
-
-            // Set up params — interface param gets concrete class name
-            size_t argIdx = 0;
-            for (size_t i = 0; i < decl.params.size(); ++i) {
-              auto &param = decl.params[i];
-              auto *arg = func->getArg(argIdx);
-              arg->setName(param.name);
-              auto *alloca = builder_.CreateAlloca(getLLVMType(param.type), nullptr, param.name);
-              builder_.CreateStore(arg, alloca);
-              namedValues_[param.name] = {alloca, param.type};
-
-              // If this is the interface param, set concrete class
-              if (i == pi) {
-                varClassName_[param.name] = className;
-              }
-              argIdx++;
-            }
-
-            emitBlock(decl.body, decl);
-
-            if (!builder_.GetInsertBlock()->getTerminator()) {
-              if (decl.hackReturnType == HackType::Void)
-                builder_.CreateRetVoid();
-              else
-                builder_.CreateRet(llvm::Constant::getNullValue(
-                    getLLVMType(decl.hackReturnType)));
-            }
-
-            if (llvm::verifyFunction(*func, &llvm::errs())) {
-              llvm::errs() << "Verification failed for monomorphized: " << monoName << "\n";
-            }
-          }
-        }
-      }
     }
   }
 
   // Emit regular function bodies
   for (const auto &decl : prog.functions) {
     if (decl.isExtern) continue;
-    currentImplStrategy_ = DispatchStrategy::Vtable; // default
     emitFunction(decl);
   }
 }
